@@ -2,6 +2,96 @@ import { Request, Response } from 'express';
 import { requireServerDb } from '../lib/supabaseServer';
 import { Dispositivo } from '../interfaces/database.types';
 
+/** Normaliza tipo para comparaciones (p. ej. frontend en minúsculas: `termostato`). */
+function tipoNormalizado(tipo: string): string {
+  return tipo.trim().toLowerCase();
+}
+
+/**
+ * Contrato `estado` para tipo termostato (POST/PATCH):
+ * - Objeto JSON (no array).
+ * - `temp_objetivo`: número finito (acepta string numérico, p. ej. `"22.5"`).
+ * - `modo`: entero 0–3 (acepta string entero, p. ej. `"2"`; rechaza `"2.5"`).
+ * - `humedad`: opcional; si viene, número finito (acepta string numérico).
+ * Otras claves del objeto se conservan tal cual (p. ej. campos extra del cliente).
+ * Devuelve el mismo objeto con temp_objetivo / modo / humedad normalizados a number.
+ */
+type ParseEstadoTermostatoOk = { ok: true; estado: Record<string, unknown> };
+type ParseEstadoTermostatoErr = { ok: false; message: string };
+
+function coerceFiniteNumber(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'boolean' || typeof v === 'object') return null;
+  if (typeof v === 'string' && v.trim() === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Entero 0–3; acepta number o string numérico entero. */
+function coerceModo(v: unknown): number | null {
+  const n = coerceFiniteNumber(v);
+  if (n === null) return null;
+  if (!Number.isInteger(n)) return null;
+  if (n < 0 || n > 3) return null;
+  return n;
+}
+
+function parseNormalizarEstadoTermostato(estado: unknown): ParseEstadoTermostatoOk | ParseEstadoTermostatoErr {
+  if (estado === null || estado === undefined) {
+    return { ok: false, message: 'Para tipo termostato, estado es obligatorio (objeto JSON).' };
+  }
+  if (typeof estado !== 'object' || Array.isArray(estado)) {
+    return { ok: false, message: 'Para tipo termostato, estado debe ser un objeto JSON.' };
+  }
+  const e = estado as Record<string, unknown>;
+  if (!('temp_objetivo' in e) || e.temp_objetivo === null || e.temp_objetivo === undefined) {
+    return {
+      ok: false,
+      message: 'Para tipo termostato, estado.temp_objetivo es obligatorio (número finito).',
+    };
+  }
+  const temp = coerceFiniteNumber(e.temp_objetivo);
+  if (temp === null) {
+    return {
+      ok: false,
+      message: 'Para tipo termostato, estado.temp_objetivo debe ser un número finito (o string numérico).',
+    };
+  }
+  if (!('modo' in e) || e.modo === null || e.modo === undefined) {
+    return {
+      ok: false,
+      message: 'Para tipo termostato, estado.modo es obligatorio (entero 0–3, o string entero).',
+    };
+  }
+  const modo = coerceModo(e.modo);
+  if (modo === null) {
+    return {
+      ok: false,
+      message: 'Para tipo termostato, estado.modo debe ser un entero entre 0 y 3 (o string entero, p. ej. "2").',
+    };
+  }
+  let humedadNormalizada: number | undefined;
+  if ('humedad' in e && e.humedad !== null && e.humedad !== undefined) {
+    const h = coerceFiniteNumber(e.humedad);
+    if (h === null) {
+      return {
+        ok: false,
+        message: 'Para tipo termostato, estado.humedad (opcional) debe ser un número finito (o string numérico).',
+      };
+    }
+    humedadNormalizada = h;
+  }
+
+  const out: Record<string, unknown> = { ...e };
+  out.temp_objetivo = temp;
+  out.modo = modo;
+  if (humedadNormalizada !== undefined) {
+    out.humedad = humedadNormalizada;
+  }
+  return { ok: true, estado: out };
+}
+
+/** Lista todos los dispositivos accesibles (ambientes de las viviendas del usuario). El filtro por tipo (p. ej. termostato) lo hace el cliente. */
 export const getDispositivos = async (req: Request, res: Response) => {
   try {
     const db = requireServerDb(res);
@@ -149,6 +239,21 @@ export const getDispositivoById = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * POST /api/dispositivos
+ *
+ * `tipo` no está acotado solo a "luz": acepta cualquier string no vacío (p. ej. `luz`, `termostato`,
+ * `sensor`, …) según lo que permita la columna/enum en Supabase. Se recomienda minúsculas para
+ * coincidir con enums típicos en PostgreSQL.
+ *
+ * Cuerpo típico (whitelist de columnas insertables desde el cliente):
+ * - ambiente_id (UUID), nombre, tipo, zona?, estado (jsonb), en_linea?, ultima_actividad?
+ *
+ * Ejemplo termostato (validación suave si tipo normalizado === "termostato"):
+ * `{ "ambiente_id": "…", "nombre": "Living", "tipo": "termostato", "zona": "Living",
+ *    "estado": { "temp_objetivo": 22.5, "modo": 2, "humedad": 45 } }`
+ * (`humedad` opcional; `modo` entero 0–3. Strings numéricos se normalizan a number al persistir.)
+ */
 export const createDispositivo = async (req: Request, res: Response) => {
   try {
     const db = requireServerDb(res);
@@ -193,12 +298,22 @@ export const createDispositivo = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'nombre y tipo son requeridos' });
     }
 
+    const tipoTrim = nuevoDispositivo.tipo.trim();
+    let estadoInsert: unknown = nuevoDispositivo.estado;
+    if (tipoNormalizado(tipoTrim) === 'termostato') {
+      const parsed = parseNormalizarEstadoTermostato(nuevoDispositivo.estado);
+      if (!parsed.ok) {
+        return res.status(400).json({ message: parsed.message });
+      }
+      estadoInsert = parsed.estado;
+    }
+
     // Evitar que el cliente fuerce campos sensibles
     const insertPayload: Partial<Dispositivo> = {
-      nombre: nuevoDispositivo.nombre,
-      tipo: nuevoDispositivo.tipo,
+      nombre: nuevoDispositivo.nombre.trim(),
+      tipo: tipoTrim,
       zona: nuevoDispositivo.zona ?? null,
-      estado: nuevoDispositivo.estado,
+      estado: estadoInsert as Dispositivo['estado'],
       en_linea: nuevoDispositivo.en_linea ?? null,
       ultima_actividad: nuevoDispositivo.ultima_actividad ?? null,
       ambiente_id: ambiente_id,
@@ -217,6 +332,12 @@ export const createDispositivo = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * PATCH /api/dispositivos/:id
+ * Contrato: mismo acceso que antes (dispositivos en ambientes de las viviendas del usuario).
+ * Si el tipo efectivo es termostato y el body incluye `estado`, se parsea/normaliza como en POST.
+ * Respuesta 200: fila completa del dispositivo tras el UPDATE (`.select()`), con `estado` persistido.
+ */
 export const updateDispositivo = async (req: Request, res: Response) => {
   try {
     const db = requireServerDb(res);
@@ -271,6 +392,39 @@ export const updateDispositivo = async (req: Request, res: Response) => {
       return res.status(403).json({ message: 'No tienes acceso al ambiente destino' });
     }
 
+    const { data: actualRow, error: fetchError } = await db
+      .from('dispositivos')
+      .select('tipo')
+      .eq('id', id)
+      .in('ambiente_id', ambienteIdsPermitidos)
+      .maybeSingle();
+    if (fetchError) throw fetchError;
+    if (!actualRow) {
+      return res.status(404).json({ message: 'Dispositivo no encontrado o no autorizado' });
+    }
+
+    if (typeof updates.tipo === 'string') {
+      updates.tipo = updates.tipo.trim();
+    }
+    if (typeof updates.nombre === 'string') {
+      updates.nombre = updates.nombre.trim();
+    }
+
+    // Mismo parseo/normalización que POST si el tipo efectivo es termostato y el cliente envía estado.
+    if ('estado' in updates) {
+      const tipoEfectivo =
+        updates.tipo !== undefined && typeof updates.tipo === 'string'
+          ? updates.tipo
+          : String(actualRow.tipo ?? '');
+      if (tipoNormalizado(tipoEfectivo) === 'termostato') {
+        const parsed = parseNormalizarEstadoTermostato(updates.estado);
+        if (!parsed.ok) {
+          return res.status(400).json({ message: parsed.message });
+        }
+        updates.estado = parsed.estado as Dispositivo['estado'];
+      }
+    }
+
     const { data, error } = await db
       .from('dispositivos')
       .update(updates)
@@ -281,6 +435,7 @@ export const updateDispositivo = async (req: Request, res: Response) => {
     if (error) throw error;
     if (!data || data.length === 0) return res.status(404).json({ message: 'Dispositivo no encontrado o no autorizado' });
 
+    // Fila completa con `estado` ya guardado (útil para que el provider Flutter reemplace el ítem).
     res.json(data[0]);
   } catch (error: any) {
     res.status(500).json({ error: error.message });

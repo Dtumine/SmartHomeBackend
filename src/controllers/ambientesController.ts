@@ -175,3 +175,71 @@ export const updateAmbiente = async (req: Request, res: Response) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+/**
+ * DELETE /api/ambientes/:id
+ * Requiere que el ambiente pertenezca a una vivienda del usuario (misma lógica que updateAmbiente).
+ * Si hay dispositivos con este ambiente_id: 409 (no se usa ON DELETE CASCADE en la política del API).
+ * Éxito: 200 + { status: 'success', message } (mismo criterio que deleteDispositivo para clientes que parsean JSON).
+ */
+export const deleteAmbiente = async (req: Request, res: Response) => {
+  try {
+    const db = requireServerDb(res);
+    if (!db) return;
+
+    const { id } = req.params;
+    const usuario_id = req.user?.id;
+    if (!usuario_id) {
+      return res.status(401).json({ message: 'No autenticado' });
+    }
+
+    const { data: userViviendas, error: viviendasError } = await db
+      .from('viviendas')
+      .select('id')
+      .eq('usuario_id', usuario_id);
+    if (viviendasError) throw viviendasError;
+    const viviendaIds = userViviendas?.map((v) => v.id) || [];
+
+    const { data: ambienteActual, error: ambienteError } = await db
+      .from('ambientes')
+      .select('id, vivienda_id')
+      .eq('id', id)
+      .in('vivienda_id', viviendaIds)
+      .maybeSingle();
+    if (ambienteError) throw ambienteError;
+    if (!ambienteActual) {
+      return res.status(404).json({ message: 'Ambiente no encontrado o no autorizado' });
+    }
+
+    const { data: dispEnAmbiente, error: dispError } = await db
+      .from('dispositivos')
+      .select('id')
+      .eq('ambiente_id', id)
+      .limit(1);
+    if (dispError) throw dispError;
+    if (dispEnAmbiente && dispEnAmbiente.length > 0) {
+      return res.status(409).json({
+        status: 'error',
+        message:
+          'Hay dispositivos en este ambiente; reasigná o eliminá los dispositivos primero',
+      });
+    }
+
+    const { data: borrado, error: delError } = await db
+      .from('ambientes')
+      .delete()
+      .eq('id', id)
+      .select('id');
+    if (delError) throw delError;
+    if (!borrado || borrado.length === 0) {
+      return res.status(404).json({ message: 'Ambiente no encontrado o no autorizado' });
+    }
+
+    res.status(200).json({
+      status: 'success',
+      message: 'Ambiente eliminado',
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+};
