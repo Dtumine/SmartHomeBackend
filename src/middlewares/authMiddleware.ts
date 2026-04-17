@@ -15,16 +15,18 @@ declare global {
 
 export const authenticate = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const authHeader = req.headers.authorization;
+    const authHeader = req.headers.authorization?.trim();
+    const bearerMatch = authHeader ? /^Bearer\s+(.+)$/i.exec(authHeader) : null;
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (!bearerMatch) {
       return res.status(401).json({
         status: 'error',
-        message: 'No se proporcionó un token de autenticación válido'
+        message:
+          'No se proporcionó un token de autenticación válido. Usá el header Authorization: Bearer <access_token> (token JWT del login).',
       });
     }
 
-    const token = authHeader.split(' ')[1];
+    const token = bearerMatch[1]!.trim();
 
     // Verificar el token con Supabase
     const { data: { user }, error } = await supabase.auth.getUser(token);
