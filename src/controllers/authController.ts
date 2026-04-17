@@ -3,18 +3,24 @@ import { supabase } from '../lib/supabase';
 
 export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const email = (body as { email?: unknown }).email;
+    const password = (body as { password?: unknown }).password;
 
-    if (!email || !password) {
+    const emailStr = typeof email === 'string' ? email.trim() : '';
+    const passwordStr = typeof password === 'string' ? password : '';
+
+    if (!emailStr || !passwordStr) {
       return res.status(400).json({
         status: 'error',
-        message: 'Email y contraseña son requeridos'
+        message:
+          'Email y contraseña son requeridos. Enviá JSON con Content-Type: application/json (p. ej. {"email":"...","password":"..."}).',
       });
     }
 
     const { data, error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
+      email: emailStr,
+      password: passwordStr,
     });
 
     if (error) {
